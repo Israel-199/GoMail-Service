@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"log"
 	"time"
-	"github.com/mattn/go-sqlite3"
 )
 
+// EmailEntry represents a record in the "emails" table.
 type EmailEntry struct {
 	Id          int64
 	Email       string
@@ -14,132 +14,132 @@ type EmailEntry struct {
 	OptOut      bool
 }
 
-func TryCreate(db *sql.DB){
-	_,err:=db.Exec(`
-	CREATE TABLE emails (
-	id  INTEGER PRIMARY KEY,
-	email  TEXT UNIQUE,
-	confirmed_at  INTEGER,
-	opt_out   INTEGER
+// TryCreate creates the "emails" table if it doesn't exist yet.
+func TryCreate(db *sql.DB) {
+	_, err := db.Exec(`
+	CREATE TABLE IF NOT EXISTS emails (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		email TEXT UNIQUE NOT NULL,
+		confirmed_at INTEGER DEFAULT 0,
+		opt_out INTEGER DEFAULT 0
 	);
 	`)
 	if err != nil {
-		if sqlError, ok :=err.(sqlite3.Error); {
-			if sqlError.Code != 1{
-				log.Fatal(sqlError)
-			}
-		} else {
-			log.Fatal(err)
-		}
+		log.Fatalf("Failed to create table: %v", err)
 	}
 }
 
-func emailEntryFromRow(row *sql.Rows)(*EmailEntry,error){
+// Converts one row from SQL into an EmailEntry struct
+func emailEntryFromRow(row *sql.Rows) (*EmailEntry, error) {
 	var id int64
 	var email string
 	var confirmedAt int64
-	var optOut bool
+	var optOutInt int
 
-	err:= row.Scan(&id,&email,&confirmedAt,&optOut)
+	if err := row.Scan(&id, &email, &confirmedAt, &optOutInt); err != nil {
+		return nil, err
+	}
 
+	var confirmedAtTime *time.Time
+	if confirmedAt > 0 {
+		t := time.Unix(confirmedAt, 0)
+		confirmedAtTime = &t
+	}
+
+	optOut := optOutInt != 0
+	return &EmailEntry{Id: id, Email: email, ConfirmedAt: confirmedAtTime, OptOut: optOut}, nil
+}
+
+// CreateEmail inserts a new email into the database
+func CreateEmail(db *sql.DB, email string) error {
+	_, err := db.Exec(`
+	INSERT INTO emails (email, confirmed_at, opt_out)
+	VALUES (?, 0, 0)
+	ON CONFLICT(email) DO NOTHING;
+	`, email)
 	if err != nil {
-        log.Println(err)
-		return nil,err
+		log.Println("CreateEmail error:", err)
 	}
-	t := time.Unix(confirmedAt,0)
-	return &EmailEntry{Id:id,Email: email,ConfirmedAt:&t,OptOut: optOut},nil
+	return err
 }
 
-func CreateEmail(db *sql.DB, email string) error{
-	_,err := db.Exec(`INSERT INTO
-	emails(email,confirmed_at,opt_out)
-	VALUE(?,0,false)
-	`,email)
-	if err!=nil{
-		log.Println(err)
-		return err
-	}
-	return nil
-}
-
-func GetEmail(db *sql.DB, email string)(*EmailEntry,error){
-	row,err := db.Query(`
+// GetEmail retrieves a single email entry from the database
+func GetEmail(db *sql.DB, email string) (*EmailEntry, error) {
+	rows, err := db.Query(`
 	SELECT id, email, confirmed_at, opt_out
 	FROM emails
-	WHERE emails = ?
-	`,email)
-	if err!=nil{
-		log.Println(err)
-		return nil,err
+	WHERE email = ?
+	`, email)
+	if err != nil {
+		return nil, err
 	}
-	defer row.Close()
+	defer rows.Close()
 
-	for rows.Next(){
+	if rows.Next() {
 		return emailEntryFromRow(rows)
 	}
-
-	return nil,nil
+	return nil, nil
 }
-func UpdateEmail(db *sql.DB, email string)(*EmailEntry,error){
-	t := entry.ConfirmedAt.Unix()
-	_,err := db.Exec(`
-	emails(email, confirmed_at, opt_out)
-		VALUE(?,?,?)
-		ON CONFLICT(email) DO UPDATE SET
-		confirmed_at=?
-		opt_out=?
-	`,entry.Email,t,entry.OptOut,t,entry.OptOut)
-	if err!=nil{
-		log.Println(err)
-		return nil,err
+
+// UpdateEmail updates an existing email entry (confirmation or opt-out)
+func UpdateEmail(db *sql.DB, entry *EmailEntry) error {
+	var confirmedAtUnix int64
+	if entry.ConfirmedAt != nil {
+		confirmedAtUnix = entry.ConfirmedAt.Unix()
 	}
-
-	return nil
+	_, err := db.Exec(`
+	UPDATE emails
+	SET confirmed_at = ?, opt_out = ?
+	WHERE email = ?;
+	`, confirmedAtUnix, entry.OptOut, entry.Email)
+	if err != nil {
+		log.Println("UpdateEmail error:", err)
+	}
+	return err
 }
+
+// DeleteEmail marks an email as opted out
 func DeleteEmail(db *sql.DB, email string) error {
-	_,err := db.Exec(`
-	UPDATE emails SET opt_out=true WHERE email=? 
-	`,email)
-	if err!=nil{
-		log.Println(err)
-		return err 
+	_, err := db.Exec(`
+	UPDATE emails
+	SET opt_out = 1
+	WHERE email = ?;
+	`, email)
+	if err != nil {
+		log.Println("DeleteEmail error:", err)
 	}
-
-	return nil
+	return err
 }
 
-type GetEmailBatchQueryParams struct{
-	Page int
+// GetEmailBatchQueryParams holds pagination parameters
+type GetEmailBatchQueryParams struct {
+	Page  int
 	Count int
 }
 
-func GetEmailBatch(db *sql.DB,params GetEmailBatchQueryParams) ([]EmailEntry
-){
-	var empty []EmailEntry
-
-	row,err := db.Query(`
+// GetEmailBatch retrieves multiple non-opted-out emails with pagination
+func GetEmailBatch(db *sql.DB, params GetEmailBatchQueryParams) ([]EmailEntry, error) {
+	rows, err := db.Query(`
 	SELECT id, email, confirmed_at, opt_out
 	FROM emails
-	WHERE opt_out = false
+	WHERE opt_out = 0
 	ORDER BY id ASC
-	LIMIT ? OFFSET ?
-	`,params.Count,(params.Page-1)*params.Count)
+	LIMIT ? OFFSET ?;
+	`, params.Count, (params.Page-1)*params.Count)
 
-	if err!=nil{
-		log.Println(err)
-		return empty, err 
+	if err != nil {
+		return nil, err
 	}
-defer row.Close()
+	defer rows.Close()
 
-emails:= make([]EmailEntry,0,params.Count)	
-
-   for rows.Next(){
-		email,err := emailEntryFromRow(rows)
-		if err!=nil{
-		return nil, err 
-	}
-	emails = append(emails, *email)
+	emails := make([]EmailEntry, 0, params.Count)
+	for rows.Next() {
+		entry, err := emailEntryFromRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		emails = append(emails, *entry)
 	}
 
-	return emails,nil
+	return emails, nil
 }
